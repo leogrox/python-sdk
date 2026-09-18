@@ -29,6 +29,13 @@ def test_matches_rfc6570_reserved_expansion():
     assert t.matches("file://docs/src/main.py") == {"path": "src/main.py"}
 
 
+def test_matches_template_with_non_ascii_literal():
+    # A resource URI travels the wire as an AnyUrl, which pct-encodes a
+    # non-ASCII literal, so that encoded form is what routing has to match.
+    t = _make("file:///docs/café/{name}")
+    assert t.matches("file:///docs/caf%C3%A9/a.txt") == {"name": "a.txt"}
+
+
 def test_matches_rejects_encoded_slash_traversal():
     # %2F decodes to / in UriTemplate.match(), giving "../../etc/passwd".
     # ResourceSecurity's traversal check then rejects the '..' components.

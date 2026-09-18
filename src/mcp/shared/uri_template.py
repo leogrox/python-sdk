@@ -41,6 +41,17 @@ Reserved expansion ``{+var}`` leaves ``?`` and ``#`` unencoded, but
 the scan stops at those characters so ``{+path}{?q}`` can separate path
 from query. A value containing a literal ``?`` or ``#`` expands fine
 but will not round-trip through ``match()``.
+
+Literal encoding
+----------------
+
+Literal text between expressions is pct-encoded on expansion per
+RFC 6570 §3.1, which keeps the result a valid RFC 3986 URI: a template
+may be written with non-ASCII characters or spaces, but
+``file:///docs/café/{name}`` expands under ``/docs/caf%C3%A9/``.
+Matching uses that same encoded form, so an expanded URI — and the
+pct-encoded URI a conforming client puts on the wire — matches the
+template it came from.
 """
 
 from __future__ import annotations
@@ -223,6 +234,24 @@ def _encode(value: str, *, allow_reserved: bool) -> str:
         last = m.end()
     out.append(quote(value[last:], safe=_RESERVED))
     return "".join(out)
+
+
+def _encode_literal(text: str) -> str:
+    """Percent-encode a literal run per RFC 6570 §3.1.
+
+    A template may carry literal characters that RFC 3986 does not
+    allow in a URI — most visibly ``ucschar`` (``file:///docs/café/``)
+    and spaces — and §3.1 requires those to be pct-encoded as UTF-8
+    when the template is expanded. Reserved and unreserved characters
+    are structural and stay as written, and existing ``%XX`` triplets
+    pass through unchanged, so a literal that is already encoded is not
+    encoded twice.
+
+    Applied to both directions: :meth:`UriTemplate.expand` emits
+    encoded literals, and the match atoms are built from the same form
+    so an expanded URI still matches the template it came from.
+    """
+    return _encode(text, allow_reserved=True)
 
 
 def _expand_expression(expr: _Expression, variables: Mapping[str, str | Sequence[str]]) -> str:
@@ -451,7 +480,7 @@ class UriTemplate:
         out: list[str] = []
         for part in self._parts:
             if isinstance(part, str):
-                out.append(part)
+                out.append(_encode_literal(part))
             else:
                 out.append(_expand_expression(part, variables))
         return "".join(out)
@@ -899,7 +928,9 @@ def _flatten(parts: list[_Part]) -> list[_Atom]:
 
     for part in parts:
         if isinstance(part, str):
-            push_lit(part)
+            # Encoded so the atoms line up with what expand() emits: a
+            # conforming client sends the pct-encoded form (RFC 6570 §3.1).
+            push_lit(_encode_literal(part))
             continue
         spec = _OPERATOR_SPECS[part.operator]
         for i, var in enumerate(part.variables):

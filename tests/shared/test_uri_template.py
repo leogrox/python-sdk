@@ -485,6 +485,38 @@ def test_expand_preserves_special_chars_in_reserved():
 
 
 @pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        # RFC 6570 §3.1: a literal the URI grammar doesn't allow is pct-encoded
+        # as UTF-8 on expansion (uritemplate-test, "Literal Encoding").
+        ("café/{v}", "caf%C3%A9/value"),
+        ("file:///my docs/{v}", "file:///my%20docs/value"),
+        # Reserved and unreserved literal characters are structural: kept as written.
+        ("file:///a-b_c~d.e/{v}", "file:///a-b_c~d.e/value"),
+        ("http://x.test/p?q=1&r=2#{v}", "http://x.test/p?q=1&r=2#value"),
+        # A literal already written in encoded form is not encoded twice.
+        ("file:///docs/caf%C3%A9/{v}", "file:///docs/caf%C3%A9/value"),
+        # A bare % is not a triplet, so it is encoded.
+        ("file:///100%/{v}", "file:///100%25/value"),
+    ],
+)
+def test_expand_encodes_literals(template: str, expected: str):
+    assert UriTemplate.parse(template).expand({"v": "value"}) == expected
+
+
+def test_match_accepts_encoded_literal():
+    """The wire form of a non-ASCII literal is what a conforming client sends."""
+    t = UriTemplate.parse("file:///docs/café/{name}")
+    assert t.match("file:///docs/caf%C3%A9/a.txt") == {"name": "a.txt"}
+
+
+@pytest.mark.parametrize("template", ["file:///docs/café/{name}", "file:///my docs/{name}"])
+def test_expand_match_roundtrip_with_encoded_literal(template: str):
+    t = UriTemplate.parse(template)
+    assert t.match(t.expand({"name": "a.txt"})) == {"name": "a.txt"}
+
+
+@pytest.mark.parametrize(
     "value",
     [42, None, 3.14, {"a": "b"}, ["ok", 42], b"bytes"],
 )
