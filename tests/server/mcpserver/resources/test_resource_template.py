@@ -30,10 +30,15 @@ def test_matches_rfc6570_reserved_expansion():
 
 
 def test_matches_template_with_non_ascii_literal():
-    # A resource URI travels the wire as an AnyUrl, which pct-encodes a
-    # non-ASCII literal, so that encoded form is what routing has to match.
+    # A conforming client sends the non-ASCII literal pct-encoded (RFC 3986).
     t = _make("file:///docs/café/{name}")
     assert t.matches("file:///docs/caf%C3%A9/a.txt") == {"name": "a.txt"}
+
+
+def test_matches_template_with_non_ascii_literal_sent_unencoded():
+    # `resources/read` carries the URI as a plain str, so a client may send it raw.
+    t = _make("file:///docs/café/{name}")
+    assert t.matches("file:///docs/café/a.txt") == {"name": "a.txt"}
 
 
 def test_matches_rejects_encoded_slash_traversal():

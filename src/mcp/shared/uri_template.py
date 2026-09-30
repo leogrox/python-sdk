@@ -51,7 +51,8 @@ may be written with non-ASCII characters or spaces, but
 ``file:///docs/café/{name}`` expands under ``/docs/caf%C3%A9/``.
 Matching uses that same encoded form, so an expanded URI — and the
 pct-encoded URI a conforming client puts on the wire — matches the
-template it came from.
+template it came from. The input is normalized the same way first, so
+a URI sent with its literals unencoded still matches.
 """
 
 from __future__ import annotations
@@ -248,8 +249,10 @@ def _encode_literal(text: str) -> str:
     encoded twice.
 
     Applied to both directions: :meth:`UriTemplate.expand` emits
-    encoded literals, and the match atoms are built from the same form
-    so an expanded URI still matches the template it came from.
+    encoded literals, the match atoms are built from the same form so an
+    expanded URI still matches the template it came from, and
+    :meth:`UriTemplate.match` normalizes its input with it so a URI sent
+    unencoded matches too.
     """
     return _encode(text, allow_reserved=True)
 
@@ -546,6 +549,10 @@ class UriTemplate:
         """
         if len(uri) > max_uri_length:
             return None
+
+        # `uri` arrives as a plain str, so a client may send literals raw or
+        # pct-encoded; captured values are decoded below either way.
+        uri = _encode_literal(uri)
 
         if self._query_variables:
             # Two-phase: scan matches the path, the query is split and

@@ -510,6 +510,16 @@ def test_match_accepts_encoded_literal():
     assert t.match("file:///docs/caf%C3%A9/a.txt") == {"name": "a.txt"}
 
 
+@pytest.mark.parametrize(
+    "uri",
+    ["file:///docs/café/a b.txt", "file:///docs/caf%C3%A9/a b.txt", "file:///docs/caf%C3%A9/a%20b.txt"],
+)
+def test_match_extracts_same_value_whether_uri_is_sent_raw_or_encoded(uri: str):
+    """SDK-defined: `resources/read` carries the URI as a plain string, so both forms must keep matching."""
+    t = UriTemplate.parse("file:///docs/café/{name}")
+    assert t.match(uri) == {"name": "a b.txt"}
+
+
 @pytest.mark.parametrize("template", ["file:///docs/café/{name}", "file:///my docs/{name}"])
 def test_expand_match_roundtrip_with_encoded_literal(template: str):
     t = UriTemplate.parse(template)
