@@ -110,7 +110,7 @@ class StdioServerParameters(BaseModel):
     """The working directory to use when spawning the process."""
 
     encoding: str = "utf-8"
-    """Text encoding for messages to and from the server."""
+    """Text encoding for messages to and from the server, and for its relayed stderr (see `stdio_client`)."""
 
     encoding_error_handler: Literal["strict", "ignore", "replace"] = "strict"
     """Encoding error handler; see https://docs.python.org/3/library/codecs.html#error-handlers."""
@@ -243,9 +243,10 @@ def _needs_stderr_relay(errlog: TextIO) -> bool:
     try:
         errlog.fileno()
     except (AttributeError, io.UnsupportedOperation):
-        # No descriptor (pytest's capsys, Databricks' logging stream); an int such
-        # as `subprocess.DEVNULL` has no `write()` and still goes to the spawn.
-        return hasattr(errlog, "write")
+        # No descriptor (pytest's capsys, Databricks' logging stream). An int such as
+        # `subprocess.DEVNULL`, or a binary stream such as `io.BytesIO`, cannot take
+        # text and still goes to the spawn, which accepts or rejects it up front.
+        return hasattr(errlog, "write") and not isinstance(errlog, io.RawIOBase | io.BufferedIOBase)
     return False
 
 
@@ -254,26 +255,36 @@ async def _relay_stderr(process: ServerProcess, errlog: TextIO, encoding: str, d
 
     A write `errlog` rejects loses only that chunk, and only the first is logged.
     The pipe is read to the end regardless, or a chatty server would block on it.
+    `errlog` is flushed once at the end: Jupyter's stream flushes on its own, and
+    an explicit flush there makes the event loop wait on another thread.
     """
     assert process.stderr, "Opened process is missing stderr"
 
-    # Logging shims installed as sys.stderr may only write; logging.StreamHandler tolerates that too.
-    flush = getattr(errlog, "flush", None)
     write_failed = False
     try:
-        # Diagnostics must never take the transport down, so undecodable bytes are replaced.
-        async for text in TextReceiveStream(process.stderr, encoding=encoding, errors="replace"):
-            try:
-                errlog.write(text)
-                if flush is not None:
-                    flush()
-            except (OSError, ValueError):
-                if not write_failed:
-                    write_failed = True
-                    logger.exception("Writing the MCP server's stderr to errlog failed; later failures are not logged")
+        # Shielded like the stdout drain: a cancelled caller must not leave the server
+        # blocked on a full pipe. Shutdown ends the read by closing the pipe.
+        with anyio.CancelScope(shield=True):
+            # Diagnostics must never take the transport down, so undecodable bytes are replaced.
+            async for text in TextReceiveStream(process.stderr, encoding=encoding, errors="replace"):
+                try:
+                    errlog.write(text)
+                except (OSError, ValueError):
+                    if not write_failed:
+                        write_failed = True
+                        # A broken errlog is often sys.stderr, where logging reports its own failures.
+                        with suppress(OSError, ValueError):
+                            logger.exception(
+                                "Writing the MCP server's stderr to errlog failed; later failures are not logged"
+                            )
     except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):
         pass  # shutdown closed the pipe under the read, or the pipe broke
     finally:
+        # Logging shims installed as sys.stderr may only write; logging.StreamHandler tolerates that too.
+        flush = getattr(errlog, "flush", None)
+        if flush is not None:
+            with suppress(OSError, ValueError):
+                flush()
         done.set()
 
 

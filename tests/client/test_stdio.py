@@ -147,6 +147,9 @@ class _FakeStderr:
     async def feed(self, data: bytes) -> None:
         await self._send.send(data)
 
+    def feed_nowait(self, data: bytes) -> None:
+        self._send.send_nowait(data)
+
     def close_write_end(self) -> None:
         self._send.close()
 
@@ -1174,14 +1177,135 @@ async def test_shutdown_stops_waiting_for_a_stderr_pipe_that_a_survivor_holds_op
     monkeypatch.setattr(stdio, "_STDERR_DRAIN_TIMEOUT", 0.05)
     errlog = io.StringIO()
 
+    try:
+        with anyio.fail_after(5):
+            async with stdio_client(FAKE_PARAMS, errlog=errlog):
+                await process.feed_stderr(b"before exit\n")
+
+        assert errlog.getvalue() == "before exit\n"
+    finally:
+        # The survivor finally exits; without this the pipe's GC-time ResourceWarning
+        # would fail a later, unrelated test.
+        process.close_stderr()
+
+
+@pytest.mark.anyio
+async def test_cancelling_the_client_still_relays_the_stderr_a_server_writes_while_exiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled caller keeps the stderr relay reading through shutdown, as the stdout drain does.
+
+    SDK policy: otherwise the server's last words are lost, and a server writing more
+    than a pipe buffer of them blocks and is killed instead of exiting.
+    """
+
+    def say_bye_and_exit() -> None:
+        assert process.stderr is not None
+        process.stderr.feed_nowait(b"bye\n")
+        process.exit(0)
+
+    process = FakeProcess(on_stdin_close=say_bye_and_exit)
+    terminated = install_fake_process(monkeypatch, process)
+    errlog = io.StringIO()
+    entered = anyio.Event()
+    # Cancelled from the test's task, for the coverage reason given in
+    # test_cancelling_the_client_still_runs_the_full_shutdown.
+    cancel_scope = anyio.CancelScope()
+
+    async def run_client_until_cancelled() -> None:
+        with cancel_scope:
+            async with stdio_client(FAKE_PARAMS, errlog=errlog):
+                entered.set()
+                await anyio.sleep_forever()
+
+    with anyio.fail_after(5):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_client_until_cancelled)
+            await entered.wait()
+            cancel_scope.cancel()
+
+    assert errlog.getvalue() == "bye\n"
+    assert terminated == []
+
+
+@pytest.mark.anyio
+async def test_undecodable_server_stderr_is_replaced_and_split_characters_are_rejoined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bytes that are not valid in `encoding` become U+FFFD instead of failing the relay.
+
+    A character split across two pipe reads still arrives whole.
+    """
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+    errlog = io.StringIO()
+
     with anyio.fail_after(5):
         async with stdio_client(FAKE_PARAMS, errlog=errlog):
-            await process.feed_stderr(b"before exit\n")
+            for chunk in (b"caf\xe9\n", b"na\xc3", b"\xafve\n"):
+                await process.feed_stderr(chunk)
 
-    assert errlog.getvalue() == "before exit\n"
-    # The survivor finally exits; without this the pipe's GC-time ResourceWarning
-    # would fail a later test.
-    process.close_stderr()
+    assert errlog.getvalue() == "caf\ufffd\nna\u00efve\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("errlog", [None, subprocess.DEVNULL], ids=["none-as-under-pythonw", "devnull"])
+async def test_an_errlog_the_spawn_takes_as_is_opens_no_stderr_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+    errlog: int | None,
+) -> None:
+    """`None` and `subprocess.DEVNULL` still go straight to the spawn.
+
+    `sys.stderr` is `None` under pythonw and in windowed apps, which makes it the
+    default `errlog` there; `DEVNULL` is the workaround users reach for (#1806).
+    """
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS, errlog=cast(TextIO, errlog)):
+            pass
+
+    assert process.stderr is None
+
+
+@pytest.mark.anyio
+async def test_a_binary_errlog_is_still_rejected_at_spawn() -> None:
+    """A binary in-memory stream cannot take text, so the spawn rejects it before anything starts."""
+    params = StdioServerParameters(command=sys.executable, args=["-c", "pass"])
+
+    with pytest.raises(io.UnsupportedOperation):
+        async with stdio_client(params, errlog=cast(TextIO, io.BytesIO())):
+            raise NotImplementedError
+
+
+class _BrokenStream(io.StringIO):
+    """A stream whose every write fails, as a closed one's does."""
+
+    def write(self, s: str) -> int:
+        raise ValueError("I/O operation on closed file")
+
+
+@pytest.mark.anyio
+async def test_an_errlog_that_is_a_broken_sys_stderr_does_not_end_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reporting a failed relay write cannot raise, even when logging writes to the same broken stream.
+
+    With no handler configured, logging's last-resort handler writes to `sys.stderr`
+    and lets that `ValueError` escape.
+    """
+    broken = _BrokenStream()
+    monkeypatch.setattr(sys, "stderr", broken)
+    monkeypatch.setattr(stdio.logger, "propagate", False)
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS, errlog=broken):
+            await process.feed_stderr(b"lost\n")
+
+    assert process.returncode == 0
 
 
 # ---------------------------------------------------------------------------
