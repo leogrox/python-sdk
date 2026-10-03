@@ -9,10 +9,12 @@ client<->server round trip is pinned by tests/interaction/transports/test_stdio.
 
 import errno
 import gc
+import io
 import logging
 import math
 import os
 import signal
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -132,6 +134,35 @@ class _FakeStdout:
         await anyio.lowlevel.checkpoint()
 
 
+class _FakeStderr:
+    """The fake process's stderr pipe, present only when the spawn asked for one.
+
+    Closing it fails a pending read with `ClosedResourceError`, as anyio's asyncio
+    pipe wrapper does, instead of reporting EOF.
+    """
+
+    def __init__(self) -> None:
+        self._send, self._receive = anyio.create_memory_object_stream[bytes | anyio.ClosedResourceError](math.inf)
+
+    async def feed(self, data: bytes) -> None:
+        await self._send.send(data)
+
+    def close_write_end(self) -> None:
+        self._send.close()
+
+    async def receive(self) -> bytes:
+        item = await self._receive.receive()
+        if isinstance(item, anyio.ClosedResourceError):
+            raise item
+        return item
+
+    async def aclose(self) -> None:
+        with suppress(anyio.ClosedResourceError):  # the write end is already closed
+            self._send.send_nowait(anyio.ClosedResourceError())
+        self._receive.close()
+        await anyio.lowlevel.checkpoint()
+
+
 class FakeProcess:
     """In-memory stand-in for the spawned server process.
 
@@ -168,6 +199,7 @@ class FakeProcess:
         self.stdin_send_gate = stdin_send_gate
         self.on_stdout_receive = on_stdout_receive
         self.stdin = _FakeStdin(self)
+        self.stderr: _FakeStderr | None = None
 
     def _dispatch_stdout_receive(self) -> None:
         # Late-bound so a test can assign `on_stdout_receive` after construction.
@@ -182,10 +214,21 @@ class FakeProcess:
         """End the fake process's stdout, as the kernel does when it dies."""
         self._stdout_send.close()
 
+    async def feed_stderr(self, data: bytes) -> None:
+        """Make `data` readable on the fake process's stderr pipe."""
+        assert self.stderr is not None, "the spawn did not ask for a stderr pipe"
+        await self.stderr.feed(data)
+
+    def close_stderr(self) -> None:
+        """End the stderr pipe, as the kernel does once nothing holds its write end."""
+        if self.stderr is not None:
+            self.stderr.close_write_end()
+
     def exit(self, code: int = 0) -> None:
-        """Die: set the exit code and EOF stdout, as the kernel does."""
+        """Die: set the exit code and EOF stdout and stderr, as the kernel does."""
         self.returncode = code
         self.close_stdout()
+        self.close_stderr()
 
     def pending_stdout_chunks(self) -> int:
         """How many fed chunks the client has not yet pulled off the fake stdout."""
@@ -210,9 +253,11 @@ def install_fake_process(
         command: str,
         args: list[str],
         env: dict[str, str] | None = None,
-        errlog: TextIO = sys.stderr,
+        errlog: TextIO | int = sys.stderr,
         cwd: Path | str | None = None,
     ) -> FakeProcess:
+        if errlog == subprocess.PIPE:
+            process.stderr = _FakeStderr()
         return process
 
     async def fake_terminate_tree(proc: FakeProcess) -> None:
@@ -1025,6 +1070,121 @@ async def test_a_process_surviving_the_kill_escalation_is_logged_and_abandoned(
 
 
 # ---------------------------------------------------------------------------
+# Server stderr relayed to an errlog that is not a file
+# ---------------------------------------------------------------------------
+#
+# The real-process half (the relay reaching the stream, shutdown keeping the server's
+# last words, files still inherited) is in tests/transports/stdio/test_lifecycle.py.
+
+
+@pytest.mark.anyio
+async def test_server_stderr_reaches_the_sys_stderr_that_capsys_installs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Server stderr reaches pytest's `capsys` stream, a text wrapper with no file descriptor."""
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS, errlog=sys.stderr):
+            await process.feed_stderr(b"warming up\n")
+
+    assert capsys.readouterr().err == "warming up\n"
+
+
+class _StreamToLogger:
+    """Stands in for a logging shim installed as `sys.stderr`, as Databricks does: only `write()`."""
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
+    def write(self, text: str) -> int:
+        self.written.append(text)
+        return len(text)
+
+
+@pytest.mark.anyio
+async def test_server_stderr_reaches_a_logging_shim_that_only_has_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server stderr reaches a duck-typed stream with `write()` and neither `fileno()` nor `flush()`.
+
+    Handing such a stream to the spawn used to fail with `AttributeError`.
+    """
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+    errlog = _StreamToLogger()
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS, errlog=cast(TextIO, errlog)):
+            await process.feed_stderr(b"warming up\n")
+
+    assert errlog.written == ["warming up\n"]
+
+
+class _FlakyStream(io.StringIO):
+    """Rejects every write that contains `bad`, as a stream with a transient fault can."""
+
+    def write(self, s: str) -> int:
+        if "bad" in s:
+            raise ValueError("rejected")
+        return super().write(s)
+
+
+@pytest.mark.anyio
+async def test_a_write_errlog_rejects_loses_only_that_chunk_and_is_logged_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected write loses only its own chunk, later output still arrives, and one failure is logged.
+
+    A relay that stopped reading would also leave a chatty server blocked on a full pipe.
+    """
+    process = FakeProcess(on_stdin_close=lambda: process.exit(0))
+    install_fake_process(monkeypatch, process)
+    errlog = _FlakyStream()
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS, errlog=errlog):
+            for chunk in (b"one\n", b"bad two\n", b"bad three\n", b"four\n"):
+                await process.feed_stderr(chunk)
+
+    assert errlog.getvalue() == "one\nfour\n"
+    assert [record.getMessage() for record in caplog.records if record.name == stdio.__name__] == [
+        "Writing the MCP server's stderr to errlog failed; later failures are not logged"
+    ]
+
+
+@pytest.mark.anyio
+async def test_shutdown_stops_waiting_for_a_stderr_pipe_that_a_survivor_holds_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown completes, bounded, when a descendant keeps the server's stderr open past its exit.
+
+    What the server wrote before exiting still reaches `errlog`.
+    """
+
+    def exit_leaving_stderr_to_a_survivor() -> None:
+        process.returncode = 0
+        process.close_stdout()
+
+    process = FakeProcess(on_stdin_close=exit_leaving_stderr_to_a_survivor)
+    install_fake_process(monkeypatch, process)
+    monkeypatch.setattr(stdio, "_STDERR_DRAIN_TIMEOUT", 0.05)
+    errlog = io.StringIO()
+
+    with anyio.fail_after(5):
+        async with stdio_client(FAKE_PARAMS, errlog=errlog):
+            await process.feed_stderr(b"before exit\n")
+
+    assert errlog.getvalue() == "before exit\n"
+    # The survivor finally exits; without this the pipe's GC-time ResourceWarning
+    # would fail a later test.
+    process.close_stderr()
+
+
+# ---------------------------------------------------------------------------
 # POSIX tree-termination policy, tested through the sanctioned killpg seam
 # ---------------------------------------------------------------------------
 #
@@ -1412,9 +1572,11 @@ async def test_escalation_kills_a_process_that_ignores_sigterm(  # pragma: lax n
 
 @pytest.mark.anyio
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs procfs to enumerate open file descriptors")
+@pytest.mark.parametrize("make_errlog", [lambda: sys.stderr, io.StringIO], ids=["inherited-stderr", "relayed-stderr"])
 # lax no cover: Windows CI jobs enforce 100% coverage per job, have no procfs, and skip this.
 async def test_a_graceful_exit_with_a_surviving_child_leaks_no_pipe_fds(  # pragma: lax no cover
     monkeypatch: pytest.MonkeyPatch,
+    make_errlog: Callable[[], TextIO],
 ) -> None:
     """A graceful exit with a surviving child must not leak the client's pipe fds.
 
@@ -1422,8 +1584,10 @@ async def test_a_graceful_exit_with_a_surviving_child_leaks_no_pipe_fds(  # prag
     inherited pipe ends (the POSIX policy: survivors are the server's business). The
     client must still release its own pipe fds and subprocess transport at shutdown
     (on asyncio nothing else ever closes them while the orphan holds the pipe) instead
-    of leaking them for the orphan's lifetime.
+    of leaking them for the orphan's lifetime. That includes the stderr pipe read for
+    an `errlog` that is not a file, which the orphan keeps open past the drain window.
     """
+    monkeypatch.setattr(stdio, "_STDERR_DRAIN_TIMEOUT", 0.05)
     spawned = _record_spawned_processes(monkeypatch)
 
     async with AsyncExitStack() as stack:
@@ -1442,7 +1606,7 @@ async def test_a_graceful_exit_with_a_surviving_child_leaks_no_pipe_fds(  # prag
 
         # Two interpreter cold starts on a loaded runner; healthy runs take ~0.3s.
         with anyio.fail_after(15.0):
-            async with stdio_client(server_params):
+            async with stdio_client(server_params, errlog=make_errlog()):
                 stream = await _accept_alive(sock)
             await stream.aclose()
 

@@ -8,8 +8,10 @@ with every wait bounded, so a cancelled caller can neither leak a live server
 process nor hang on one.
 """
 
+import io
 import logging
 import os
+import subprocess
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -69,6 +71,9 @@ _KILL_REAP_TIMEOUT = 2.0
 # Time for the writer to flush accepted messages before stdin closes.
 _WRITER_FLUSH_TIMEOUT = 0.5
 
+# Time for the stderr relay to copy what an exited server left in the pipe.
+_STDERR_DRAIN_TIMEOUT = 0.5
+
 # How often to poll returncode while waiting for the process to die.
 _EXIT_POLL_INTERVAL = 0.01
 
@@ -117,17 +122,23 @@ async def stdio_client(
 ) -> AsyncGenerator[TransportStreams, None]:
     """Spawns an MCP server subprocess and connects to it over stdin/stdout.
 
+    The server's stderr goes to `errlog`. A file is handed to the server as its
+    stderr; any other text stream (an `io.StringIO`, a Jupyter notebook's
+    `sys.stderr`) gets the server's output through `write()` until shutdown,
+    decoded with `server.encoding`.
+
     Raises:
         OSError: If the server process cannot be spawned.
         ValueError: If the spawn parameters are invalid (embedded NUL bytes).
     """
     command = await _get_executable_command(server.command)
+    relay_stderr = _needs_stderr_relay(errlog)
 
     process = await _create_platform_compatible_process(
         command=command,
         args=server.args,
         env=get_default_environment() | (server.env or {}),
-        errlog=errlog,
+        errlog=subprocess.PIPE if relay_stderr else errlog,
         cwd=server.cwd,
     )
 
@@ -138,6 +149,7 @@ async def stdio_client(
 
     shutting_down = False
     writer_done = anyio.Event()
+    stderr_relayed = anyio.Event() if relay_stderr else None
 
     async def stdout_reader() -> None:
         assert process.stdout, "Opened process is missing stdout"
@@ -193,7 +205,7 @@ async def stdio_client(
             await writer_done.wait()
         if flush_scope.cancelled_caught:
             await anyio.lowlevel.cancel_shielded_checkpoint()  # resync coverage on 3.11 (gh-106749)
-        await _stop_server_process(process)
+        await _stop_server_process(process, stderr_relayed)
         await _aclose_all(read_stream, write_stream, read_stream_writer, write_stream_reader)
         # One pass so unblocked tasks exit via their except paths before the cancel.
         await anyio.lowlevel.checkpoint()
@@ -201,6 +213,8 @@ async def stdio_client(
     async with anyio.create_task_group() as tg:
         tg.start_soon(stdout_reader)
         tg.start_soon(stdin_writer)
+        if stderr_relayed is not None:
+            tg.start_soon(_relay_stderr, process, errlog, server.encoding, stderr_relayed)
         try:
             yield read_stream, write_stream
         finally:
@@ -214,6 +228,53 @@ async def stdio_client(
             tg.cancel_scope.cancel()
     # The cancel lands via throw(); one yield resyncs 3.11 coverage (gh-106749).
     await anyio.lowlevel.cancel_shielded_checkpoint()
+
+
+def _needs_stderr_relay(errlog: TextIO) -> bool:
+    """Whether the server's stderr has to reach `errlog` through its `write()`.
+
+    A file's descriptor is handed to the server as before. A text stream that is
+    not a plain file wrapper (`io.StringIO`, Jupyter's `sys.stderr`) only shows
+    what goes through `write()`, even when it reports a descriptor: Jupyter's
+    leads to the terminal behind the notebook.
+    """
+    if isinstance(errlog, io.TextIOBase) and not isinstance(errlog, io.TextIOWrapper):
+        return True
+    try:
+        errlog.fileno()
+    except (AttributeError, io.UnsupportedOperation):
+        # No descriptor (pytest's capsys, Databricks' logging stream); an int such
+        # as `subprocess.DEVNULL` has no `write()` and still goes to the spawn.
+        return hasattr(errlog, "write")
+    return False
+
+
+async def _relay_stderr(process: ServerProcess, errlog: TextIO, encoding: str, done: anyio.Event) -> None:
+    """Copies the server's stderr into `errlog` until the pipe ends or shutdown closes it.
+
+    A write `errlog` rejects loses only that chunk, and only the first is logged.
+    The pipe is read to the end regardless, or a chatty server would block on it.
+    """
+    assert process.stderr, "Opened process is missing stderr"
+
+    # Logging shims installed as sys.stderr may only write; logging.StreamHandler tolerates that too.
+    flush = getattr(errlog, "flush", None)
+    write_failed = False
+    try:
+        # Diagnostics must never take the transport down, so undecodable bytes are replaced.
+        async for text in TextReceiveStream(process.stderr, encoding=encoding, errors="replace"):
+            try:
+                errlog.write(text)
+                if flush is not None:
+                    flush()
+            except (OSError, ValueError):
+                if not write_failed:
+                    write_failed = True
+                    logger.exception("Writing the MCP server's stderr to errlog failed; later failures are not logged")
+    except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):
+        pass  # shutdown closed the pipe under the read, or the pipe broke
+    finally:
+        done.set()
 
 
 def _parse_line(line: str) -> SessionMessage | Exception:
@@ -246,7 +307,7 @@ async def _drain_stdout(process: ServerProcess) -> None:
                 await process.stdout.receive()
 
 
-async def _stop_server_process(process: ServerProcess) -> None:
+async def _stop_server_process(process: ServerProcess, stderr_relayed: anyio.Event | None = None) -> None:
     """Closes stdin, waits out the grace period, then kills the whole tree.
 
     The escalation order is spec text; timeouts and tree-wide scope are SDK policy:
@@ -263,8 +324,14 @@ async def _stop_server_process(process: ServerProcess) -> None:
 
     # Reaps surviving Windows job members now, not at GC; no-op on POSIX.
     close_process_job(process)
+    if stderr_relayed is not None:
+        # Closing the pipe discards unread output, such as the server's last words.
+        with anyio.move_on_after(_STDERR_DRAIN_TIMEOUT):
+            await stderr_relayed.wait()
     # A kill survivor can hold the stdout pipe open; poison the reader anyway.
     await _close_pipe(process.stdout)
+    if process.stderr is not None:
+        await _close_pipe(process.stderr)
     _close_subprocess_transport(process)
 
 
@@ -330,7 +397,7 @@ async def _create_platform_compatible_process(
     command: str,
     args: list[str],
     env: dict[str, str] | None = None,
-    errlog: TextIO = sys.stderr,
+    errlog: TextIO | int = sys.stderr,
     cwd: Path | str | None = None,
 ) -> ServerProcess:
     """Spawns the server in its own kill scope.
